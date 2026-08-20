@@ -1,0 +1,56 @@
+name: ny-taxi-learning
+
+services:
+  airflow:
+    build:
+      context: .
+      args:
+        AIRFLOW_VERSION: "3.3.0"
+        PYTHON_VERSION: "3.12"
+        CLICKHOUSE_JDBC_VERSION: "0.9.8"
+    container_name: ny-taxi-airflow
+    restart: unless-stopped
+    command: standalone
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__PARALLELISM: "4"
+      AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_STORAGE_PATH: /opt/airflow/dag-bundles
+      AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST: >-
+        [
+          {
+            "name": "ny-taxi-git",
+            "classpath": "airflow.providers.git.bundles.git.GitDagBundle",
+            "kwargs": {
+              "repo_url": "${DAGS_GIT_REPO:-file:///opt/source-repo}",
+              "tracking_ref": "${DAGS_GIT_REF:-main}",
+              "refresh_interval": 30
+            }
+          }
+        ]
+      AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type":"spark","host":"local[*]"}'
+      AIRFLOW_CONN_GIT_DEFAULT: '{"conn_type":"git","host":"localhost"}'
+      CLICKHOUSE_HOST: clickhouse-superset-lab
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_DATABASE: nyc_taxi
+      CLICKHOUSE_USER: "${CLICKHOUSE_USER:-bi}"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-bi_demo}"
+      CLICKHOUSE_JDBC_JAR: /opt/airflow/jars/clickhouse-jdbc-0.9.8-all.jar
+      JAVA_HOME: /usr/lib/jvm/default-java
+      PYSPARK_PYTHON: /usr/local/bin/python
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - airflow_data:/opt/airflow
+      - .:/opt/source-repo:ro
+    networks:
+      - default
+      - clickhouse_lab
+
+volumes:
+  airflow_data:
+
+networks:
+  clickhouse_lab:
+    external: true
+    name: clickhouse-superset-lab_default

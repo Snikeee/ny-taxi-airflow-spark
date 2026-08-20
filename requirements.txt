@@ -1,0 +1,6 @@
+apache-airflow-providers-apache-spark[pyspark]==6.3.0
+apache-airflow-providers-git==0.4.1
+clickhouse-connect==1.7.1
+pandas==2.1.4
+pyspark==4.0.4
+pyspark-client==4.0.4
