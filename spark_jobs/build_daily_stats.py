@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import os
+from datetime import date
 
+import clickhouse_connect
 from pyspark.sql import SparkSession, functions as F
 
 
@@ -12,12 +15,78 @@ def required_env(name: str) -> str:
     return value
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Считает дневные агрегаты NYC Taxi за указанный период"
+    )
+    parser.add_argument("--first_date", required=True, help="Начало периода в формате ГГГГ-ММ-ДД")
+    parser.add_argument("--last_date", required=True, help="Конец периода в формате ГГГГ-ММ-ДД")
+    args = parser.parse_args()
+
+    try:
+        args.first_date = date.fromisoformat(args.first_date)
+        args.last_date = date.fromisoformat(args.last_date)
+    except ValueError as error:
+        raise ValueError("Параметры first_date и last_date должны быть в формате ГГГГ-ММ-ДД") from error
+
+    if args.first_date > args.last_date:
+        raise ValueError("first_date не может быть позже last_date")
+
+    return args
+
+
 def main() -> None:
+    args = parse_args()
+    first_date = args.first_date.isoformat()
+    last_date = args.last_date.isoformat()
+
     host = required_env("CLICKHOUSE_HOST")
     port = os.environ.get("CLICKHOUSE_PORT", "8123")
     database = os.environ.get("CLICKHOUSE_DATABASE", "nyc_taxi")
     user = required_env("CLICKHOUSE_USER")
     password = required_env("CLICKHOUSE_PASSWORD")
+
+    print(f"Начинаем пересчёт за период {first_date} — {last_date}", flush=True)
+
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=int(port),
+        username=user,
+        password=password,
+        database=database,
+    )
+    try:
+        client.command(
+            """
+            CREATE TABLE IF NOT EXISTS nyc_taxi.daily_trip_stats
+            (
+                pickup_date Date,
+                pickup_ntaname LowCardinality(String),
+                trip_count UInt64,
+                passenger_count UInt64,
+                avg_distance Float64,
+                avg_fare_amount Float64,
+                avg_tip_amount Float64,
+                avg_total_amount Float64,
+                avg_duration_minutes Float64,
+                processed_at DateTime
+            )
+            ENGINE = MergeTree
+            PARTITION BY toYYYYMM(pickup_date)
+            ORDER BY (pickup_date, pickup_ntaname)
+            """
+        )
+        client.command(
+            f"""
+            ALTER TABLE nyc_taxi.daily_trip_stats
+            DELETE WHERE pickup_date BETWEEN toDate('{first_date}') AND toDate('{last_date}')
+            """,
+            settings={"mutations_sync": 2},
+        )
+    finally:
+        client.close()
+
+    print("Старые агрегаты за расчётный период удалены", flush=True)
 
     jdbc_url = f"jdbc:clickhouse://{host}:{port}/{database}"
     jdbc_options = {
@@ -34,9 +103,9 @@ def main() -> None:
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    print("Подключились к ClickHouse. Читаем и фильтруем поездки…", flush=True)
+    print("Читаем и фильтруем поездки из ClickHouse…", flush=True)
 
-    source_query = """
+    source_query = f"""
         (
             SELECT
                 trip_id,
@@ -52,6 +121,8 @@ def main() -> None:
             WHERE trip_distance > 0
               AND total_amount > 0
               AND dropoff_datetime > pickup_datetime
+              AND toDate(pickup_datetime)
+                  BETWEEN toDate('{first_date}') AND toDate('{last_date}')
         ) AS valid_trips
     """
 
@@ -85,7 +156,16 @@ def main() -> None:
     )
 
     aggregate_rows = stats.count()
+    if aggregate_rows == 0:
+        stats.unpersist()
+        spark.stop()
+        raise RuntimeError(
+            f"За период {first_date} — {last_date} не найдено поездок для расчёта"
+        )
+
+    valid_trips = stats.agg(F.sum("trip_count")).first()[0]
     print(f"Расчёт закончен: получилось {aggregate_rows} строк с агрегатами", flush=True)
+    print(f"В расчёт вошло поездок: {valid_trips}", flush=True)
     print("Записываем результат в nyc_taxi.daily_trip_stats…", flush=True)
 
     (
