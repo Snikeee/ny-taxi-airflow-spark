@@ -30,11 +30,6 @@ services:
         ]
       AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type":"spark","host":"local[*]"}'
       AIRFLOW_CONN_GIT_DEFAULT: '{"conn_type":"git","host":"localhost"}'
-      CLICKHOUSE_HOST: clickhouse-superset-lab
-      CLICKHOUSE_PORT: "8123"
-      CLICKHOUSE_DATABASE: nyc_taxi
-      CLICKHOUSE_USER: "${CLICKHOUSE_USER:-bi}"
-      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-bi_demo}"
       CLICKHOUSE_JDBC_JAR: /opt/airflow/jars/clickhouse-jdbc-0.9.8-all.jar
       JAVA_HOME: /usr/lib/jvm/default-java
       PYSPARK_PYTHON: /usr/local/bin/python

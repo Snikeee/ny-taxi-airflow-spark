@@ -41,6 +41,22 @@ Airflow будет доступен на [http://localhost:8080](http://localhos
 docker compose logs airflow | grep -i password
 ```
 
+После первого запуска добавьте в Airflow подключение к ClickHouse через раздел
+**Admin → Connections**:
+
+| Поле | Значение |
+|---|---|
+| Connection Id | `clickhouse_default` |
+| Connection Type | `Generic` |
+| Host | `clickhouse-superset-lab` |
+| Port | `8123` |
+| Schema | `nyc_taxi` |
+| Login | пользователь ClickHouse |
+| Password | пароль пользователя |
+
+Spark получает параметры подключения из этого Connection только во время запуска
+задачи. Пароль не хранится в репозитории или YAML-манифесте.
+
 ## Ручной пересчёт
 
 Период задаётся включительно параметрами `first_date` и `last_date`:

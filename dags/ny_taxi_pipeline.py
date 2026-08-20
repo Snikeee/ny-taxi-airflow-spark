@@ -117,13 +117,17 @@ def check_lineage(jobs: list[dict[str, Any]]) -> dict[str, set[str]]:
     return dependencies
 
 
-def spark_environment(variable_names: list[str]) -> dict[str, str]:
-    missing = [name for name in variable_names if not os.environ.get(name)]
-    if missing:
-        raise ValueError(
-            "Не заданы переменные окружения для Spark: " + ", ".join(sorted(missing))
-        )
-    return {name: os.environ[name] for name in variable_names}
+def string_mapping(config: dict[str, Any], key: str, source: Path) -> dict[str, str]:
+    value = config.get(key, {})
+    if not isinstance(value, dict) or not all(
+        isinstance(name, str)
+        and name.strip()
+        and isinstance(content, str)
+        and content.strip()
+        for name, content in value.items()
+    ):
+        raise ValueError(f"Поле {key} в файле {source.name} должно быть словарём строк")
+    return value
 
 
 def build_dag(
@@ -151,7 +155,7 @@ def build_dag(
     if not isinstance(spark_config, dict):
         raise ValueError(f"Поле spark в файле {source.name} должно быть YAML-объектом")
 
-    env_names = string_list(spark_config, "env_vars", source)
+    env_vars = string_mapping(spark_config, "env_vars", source)
     jars_env = required_string(spark_config, "jars_env", source)
     if not os.environ.get(jars_env):
         raise ValueError(f"Не задана переменная окружения {jars_env}")
@@ -183,7 +187,7 @@ def build_dag(
                 driver_memory=spark_config.get("driver_memory", "1g"),
                 executor_memory=spark_config.get("executor_memory", "1g"),
                 conf=spark_config.get("conf", {}),
-                env_vars=spark_environment(env_names),
+                env_vars=env_vars,
                 inlets=inputs,
                 outlets=outputs,
                 doc=job.get("description"),
