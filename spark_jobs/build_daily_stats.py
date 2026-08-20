@@ -178,7 +178,37 @@ def main() -> None:
         .save()
     )
 
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=int(port),
+        username=user,
+        password=password,
+        database=database,
+    )
+    try:
+        result = client.query(
+            f"""
+            SELECT count(), sum(trip_count)
+            FROM nyc_taxi.daily_trip_stats
+            WHERE pickup_date BETWEEN toDate('{first_date}') AND toDate('{last_date}')
+            """
+        ).first_row
+    finally:
+        client.close()
+
+    written_rows, written_trips = result
+    if written_rows != aggregate_rows or written_trips != valid_trips:
+        raise RuntimeError(
+            "Проверка результата не пройдена: "
+            f"рассчитано {aggregate_rows} строк и {valid_trips} поездок, "
+            f"а записано {written_rows} строк и {written_trips} поездок"
+        )
+
     stats.unpersist()
+    print(
+        f"Проверка пройдена: записано {written_rows} строк и {written_trips} поездок",
+        flush=True,
+    )
     print("Готово: данные записаны в ClickHouse", flush=True)
 
     spark.stop()

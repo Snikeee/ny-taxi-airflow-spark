@@ -4,3 +4,4 @@ clickhouse-connect==1.7.1
 pandas==2.1.4
 pyspark==4.0.4
 pyspark-client==4.0.4
+PyYAML>=6.0,<7

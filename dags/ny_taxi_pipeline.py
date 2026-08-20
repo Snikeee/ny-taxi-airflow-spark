@@ -1,136 +1,204 @@
 from __future__ import annotations
 
-import logging
 import os
-from datetime import date
+from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
-import clickhouse_connect
 import pendulum
+import yaml
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
-from airflow.sdk import DAG, task
+from airflow.sdk import DAG, Asset
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SPARK_JOB = PROJECT_ROOT / "spark_jobs" / "build_daily_stats.py"
-log = logging.getLogger(__name__)
-
-# Для планового запуска обе даты равны началу интервала — это предыдущий день.
-# При ручном запуске их можно передать через параметры DAG.
-FIRST_DATE = "{{ params.first_date or data_interval_start | ds }}"
-LAST_DATE = "{{ params.last_date or params.first_date or data_interval_start | ds }}"
+JOBS_DIRECTORY = PROJECT_ROOT / "jobs"
+PIPELINES_DIRECTORY = PROJECT_ROOT / "pipelines"
 
 
-def clickhouse_client():
-    return clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT", "8123")),
-        username=os.environ["CLICKHOUSE_USER"],
-        password=os.environ["CLICKHOUSE_PASSWORD"],
-        database=os.environ.get("CLICKHOUSE_DATABASE", "nyc_taxi"),
-    )
+def read_yaml(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        content = yaml.safe_load(stream)
+
+    if not isinstance(content, dict):
+        raise ValueError(f"Файл {path.name} должен содержать YAML-объект")
+    return content
 
 
-with DAG(
-    dag_id="ny_taxi_daily_stats",
-    description="Дневная статистика поездок NYC Taxi: расчёт в Spark, хранение в ClickHouse",
-    schedule="0 3 * * *",
-    start_date=pendulum.datetime(2025, 1, 1, tz="Europe/Moscow"),
-    catchup=False,
-    params={"first_date": "", "last_date": ""},
-    tags=["учебный", "spark", "clickhouse"],
-) as dag:
-    build_stats = SparkSubmitOperator(
-        task_id="build_daily_stats_with_spark",
-        application=str(SPARK_JOB),
-        application_args=[
-            "--first_date",
-            FIRST_DATE,
-            "--last_date",
-            LAST_DATE,
-        ],
-        conn_id="spark_default",
-        jars=os.environ["CLICKHOUSE_JDBC_JAR"],
-        driver_memory="1g",
-        executor_memory="1g",
-        conf={
-            "spark.sql.shuffle.partitions": "4",
-            "spark.driver.extraJavaOptions": "-Duser.timezone=UTC",
-        },
-        env_vars={
-            "CLICKHOUSE_HOST": os.environ["CLICKHOUSE_HOST"],
-            "CLICKHOUSE_PORT": os.environ.get("CLICKHOUSE_PORT", "8123"),
-            "CLICKHOUSE_DATABASE": os.environ.get("CLICKHOUSE_DATABASE", "nyc_taxi"),
-            "CLICKHOUSE_USER": os.environ["CLICKHOUSE_USER"],
-            "CLICKHOUSE_PASSWORD": os.environ["CLICKHOUSE_PASSWORD"],
-        },
-    )
+def required_string(config: dict[str, Any], key: str, source: Path) -> str:
+    value = config.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"В файле {source.name} не заполнено поле {key}")
+    return value
 
-    @task
-    def validate_result(first_date: str, last_date: str) -> dict[str, object]:
-        try:
-            period_start = date.fromisoformat(first_date)
-            period_end = date.fromisoformat(last_date)
-        except ValueError as error:
-            raise ValueError(
-                "Параметры first_date и last_date должны быть в формате ГГГГ-ММ-ДД"
-            ) from error
 
-        if period_start > period_end:
-            raise ValueError("first_date не может быть позже last_date")
+def string_list(config: dict[str, Any], key: str, source: Path) -> list[str]:
+    value = config.get(key, [])
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError(f"Поле {key} в файле {source.name} должно быть списком строк")
+    return value
 
-        client = clickhouse_client()
-        try:
-            row = client.query(
-                f"""
-                SELECT
-                    count() AS aggregate_rows,
-                    sum(trip_count) AS valid_trips,
-                    min(pickup_date) AS min_date,
-                    max(pickup_date) AS max_date
-                FROM nyc_taxi.daily_trip_stats
-                WHERE pickup_date BETWEEN toDate('{first_date}') AND toDate('{last_date}')
-                """
-            ).first_row
 
-            source_trips = client.query(
-                f"""
-                SELECT count()
-                FROM nyc_taxi.trips_small
-                WHERE trip_distance > 0
-                  AND total_amount > 0
-                  AND dropoff_datetime > pickup_datetime
-                  AND toDate(pickup_datetime)
-                      BETWEEN toDate('{first_date}') AND toDate('{last_date}')
-                """
-            ).first_row[0]
-        finally:
-            client.close()
+def load_jobs() -> dict[str, dict[str, Any]]:
+    jobs: dict[str, dict[str, Any]] = {}
 
-        aggregate_rows, valid_trips, min_date, max_date = row
-        if aggregate_rows == 0 or valid_trips == 0:
-            raise ValueError("Spark завершил расчёт, но итоговая таблица осталась пустой")
-        if valid_trips != source_trips:
-            raise ValueError(
-                f"Число поездок не совпало: в источнике {source_trips}, в витрине {valid_trips}"
+    for path in sorted(JOBS_DIRECTORY.glob("*.yaml")):
+        config = read_yaml(path)
+        job_id = required_string(config, "job_id", path)
+
+        if job_id in jobs:
+            raise ValueError(f"Джоба {job_id} описана больше одного раза")
+
+        config["_source"] = path
+        jobs[job_id] = config
+
+    if not jobs:
+        raise ValueError(f"В каталоге {JOBS_DIRECTORY} не найдено ни одной джобы")
+
+    return jobs
+
+
+def resolve_application(job: dict[str, Any]) -> Path:
+    source = job["_source"]
+    relative_path = required_string(job, "application", source)
+    application = (PROJECT_ROOT / relative_path).resolve()
+
+    try:
+        application.relative_to(PROJECT_ROOT.resolve())
+    except ValueError as error:
+        raise ValueError(
+            f"Путь application джобы {job['job_id']} выходит за пределы репозитория"
+        ) from error
+
+    if not application.is_file():
+        raise ValueError(f"Не найден файл Spark-джобы: {application}")
+
+    return application
+
+
+def check_lineage(jobs: list[dict[str, Any]]) -> dict[str, set[str]]:
+    producer_by_asset: dict[str, str] = {}
+    dependencies: dict[str, set[str]] = defaultdict(set)
+
+    for job in jobs:
+        source = job["_source"]
+        for output in string_list(job, "outputs", source):
+            previous_producer = producer_by_asset.get(output)
+            if previous_producer:
+                raise ValueError(
+                    f"Asset {output} создают сразу две джобы: "
+                    f"{previous_producer} и {job['job_id']}"
+                )
+            producer_by_asset[output] = job["job_id"]
+
+    for job in jobs:
+        source = job["_source"]
+        for input_asset in string_list(job, "inputs", source):
+            producer = producer_by_asset.get(input_asset)
+            if producer and producer != job["job_id"]:
+                dependencies[job["job_id"]].add(producer)
+
+    unresolved = {job["job_id"] for job in jobs}
+    resolved: set[str] = set()
+    while unresolved:
+        ready = {
+            job_id
+            for job_id in unresolved
+            if dependencies[job_id].issubset(resolved)
+        }
+        if not ready:
+            cycle = ", ".join(sorted(unresolved))
+            raise ValueError(f"В lineage найден цикл между джобами: {cycle}")
+        resolved.update(ready)
+        unresolved.difference_update(ready)
+
+    return dependencies
+
+
+def spark_environment(variable_names: list[str]) -> dict[str, str]:
+    missing = [name for name in variable_names if not os.environ.get(name)]
+    if missing:
+        raise ValueError(
+            "Не заданы переменные окружения для Spark: " + ", ".join(sorted(missing))
+        )
+    return {name: os.environ[name] for name in variable_names}
+
+
+def build_dag(
+    pipeline: dict[str, Any],
+    source: Path,
+    job_catalog: dict[str, dict[str, Any]],
+) -> DAG:
+    dag_id = required_string(pipeline, "dag_id", source)
+    job_ids = string_list(pipeline, "jobs", source)
+    if not job_ids:
+        raise ValueError(f"В пайплайне {dag_id} нет джоб")
+
+    unknown_jobs = sorted(set(job_ids) - set(job_catalog))
+    if unknown_jobs:
+        raise ValueError(
+            f"В пайплайне {dag_id} указаны неизвестные джобы: {', '.join(unknown_jobs)}"
+        )
+    if len(job_ids) != len(set(job_ids)):
+        raise ValueError(f"В пайплайне {dag_id} одна и та же джоба указана несколько раз")
+
+    jobs = [job_catalog[job_id] for job_id in sorted(job_ids)]
+    dependencies = check_lineage(jobs)
+
+    spark_config = pipeline.get("spark", {})
+    if not isinstance(spark_config, dict):
+        raise ValueError(f"Поле spark в файле {source.name} должно быть YAML-объектом")
+
+    env_names = string_list(spark_config, "env_vars", source)
+    jars_env = required_string(spark_config, "jars_env", source)
+    if not os.environ.get(jars_env):
+        raise ValueError(f"Не задана переменная окружения {jars_env}")
+
+    start_date = pendulum.parse(required_string(pipeline, "start_date", source))
+
+    with DAG(
+        dag_id=dag_id,
+        description=pipeline.get("description"),
+        schedule=required_string(pipeline, "schedule", source),
+        start_date=start_date,
+        catchup=bool(pipeline.get("catchup", False)),
+        params=pipeline.get("params", {}),
+        tags=string_list(pipeline, "tags", source),
+    ) as dag:
+        tasks: dict[str, SparkSubmitOperator] = {}
+
+        for job in jobs:
+            job_source = job["_source"]
+            inputs = [Asset(uri) for uri in string_list(job, "inputs", job_source)]
+            outputs = [Asset(uri) for uri in string_list(job, "outputs", job_source)]
+
+            tasks[job["job_id"]] = SparkSubmitOperator(
+                task_id=job["job_id"],
+                application=str(resolve_application(job)),
+                application_args=string_list(job, "arguments", job_source),
+                conn_id=spark_config.get("conn_id", "spark_default"),
+                jars=os.environ[jars_env],
+                driver_memory=spark_config.get("driver_memory", "1g"),
+                executor_memory=spark_config.get("executor_memory", "1g"),
+                conf=spark_config.get("conf", {}),
+                env_vars=spark_environment(env_names),
+                inlets=inputs,
+                outlets=outputs,
+                doc=job.get("description"),
             )
 
-        log.info(
-            "Проверка пройдена: %s строк с агрегатами, %s поездок за период %s — %s",
-            aggregate_rows,
-            valid_trips,
-            first_date,
-            last_date,
-        )
+        for consumer, producers in sorted(dependencies.items()):
+            for producer in sorted(producers):
+                tasks[producer] >> tasks[consumer]
 
-        return {
-            "строк_с_агрегатами": aggregate_rows,
-            "обработано_поездок": valid_trips,
-            "first_date": first_date,
-            "last_date": last_date,
-            "первая_дата_с_данными": str(min_date),
-            "последняя_дата_с_данными": str(max_date),
-        }
+    return dag
 
-    validation = validate_result(FIRST_DATE, LAST_DATE)
-    build_stats >> validation
+
+JOB_CATALOG = load_jobs()
+
+for pipeline_path in sorted(PIPELINES_DIRECTORY.glob("*.yaml")):
+    pipeline_config = read_yaml(pipeline_path)
+    generated_dag = build_dag(pipeline_config, pipeline_path, JOB_CATALOG)
+    globals()[generated_dag.dag_id] = generated_dag

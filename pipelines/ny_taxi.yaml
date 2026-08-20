@@ -1,0 +1,33 @@
+dag_id: ny_taxi_daily_stats
+description: "Дневная статистика поездок NYC Taxi: расчёт в Spark, хранение в ClickHouse"
+schedule: "0 3 * * *"
+start_date: "2025-01-01T00:00:00+03:00"
+catchup: false
+
+params:
+  first_date: ""
+  last_date: ""
+
+tags:
+  - учебный
+  - spark
+  - clickhouse
+  - сгенерирован
+
+jobs:
+  - daily_trip_stats
+
+spark:
+  conn_id: spark_default
+  jars_env: CLICKHOUSE_JDBC_JAR
+  driver_memory: 1g
+  executor_memory: 1g
+  conf:
+    spark.sql.shuffle.partitions: "4"
+    spark.driver.extraJavaOptions: -Duser.timezone=UTC
+  env_vars:
+    - CLICKHOUSE_HOST
+    - CLICKHOUSE_PORT
+    - CLICKHOUSE_DATABASE
+    - CLICKHOUSE_USER
+    - CLICKHOUSE_PASSWORD

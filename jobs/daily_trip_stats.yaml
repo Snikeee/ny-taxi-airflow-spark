@@ -1,0 +1,17 @@
+job_id: daily_trip_stats
+description: >-
+  Пересчитывает дневные показатели поездок по районам и записывает результат
+  в ClickHouse.
+application: spark_jobs/build_daily_stats.py
+
+inputs:
+  - clickhouse://clickhouse-superset-lab/nyc_taxi/trips_small
+
+outputs:
+  - clickhouse://clickhouse-superset-lab/nyc_taxi/daily_trip_stats
+
+arguments:
+  - --first_date
+  - "{{ params.first_date or (data_interval_start | ds if data_interval_start else macros.ds_add(dag_run.run_after | ds, -1)) }}"
+  - --last_date
+  - "{{ params.last_date or params.first_date or (data_interval_start | ds if data_interval_start else macros.ds_add(dag_run.run_after | ds, -1)) }}"
